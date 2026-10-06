@@ -14,6 +14,10 @@
 - 临时支撑 temp_supports：登记后可在位/卸除；不计入"永久连接状态版本"；
   同样要求两端节点实际在位才参与施工期路径判断。
 - 工序回执 steps：按递增工序号提交 install / disassemble / test_load / remove_support。
+- 施工预案 plan：/plan/preview 按现有单步字段提交从末条回执后连续编号的工序
+  清单，事务内逐步预演（后步可见前步变化），成功返回每步预计结果与确认凭据，
+  预演整体回滚不留改动；/plan/confirm 携带原清单与凭据，在一次写事务中复核
+  整单，全部成功才保存并返回按序回执。
 
 校验规则
 --------
@@ -28,11 +32,19 @@
   试载记录当时版本，版本过期即失效。临时支撑的装/卸不改变版本。
 - 卸撑全部完成后可 POST /snapshots 固化验收快照；快照只增不改，
   后续修复工序不会改写旧快照。
+- 施工预案：预演逐步套用同一套传力路径与试载规则，后一步能看到前一步带来的
+  支撑、连接版本和试载变化；确认凭据绑定清单、当前登记与工序状态，预演后
+  登记或工序有变化时确认拒绝；确认在一次写事务中复核整单，任一步失败回滚
+  整单新增的工序、连接版本、临时支撑状态及试载，旧回执与验收快照不变。
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -116,6 +128,11 @@ def init_db():
     try:
         conn.executescript(SCHEMA)
         conn.execute("INSERT OR IGNORE INTO meta(k, v) VALUES('version', '0')")
+        # 施工预案确认凭据的 HMAC 密钥；老库启动时自动补写，无需迁移
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(k, v) VALUES('plan_secret', ?)",
+            (secrets.token_hex(32),),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -496,52 +513,235 @@ def _apply_remove_support(conn, body):
     }
 
 
+# ---------------------------------------------------------------- 工序执行（单步与预案共用）
+
+_ACTIONS = ("install", "disassemble", "test_load", "remove_support")
+
+
+def _last_seq(conn):
+    return conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM steps").fetchone()["s"]
+
+
+def _validate_action(action):
+    if action not in _ACTIONS:
+        raise bad_request("action 须为 install/disassemble/test_load/remove_support")
+
+
+def _apply_step(conn, seq, action, body):
+    """按工序类型套用现有传力路径与试载规则，返回本步结果。"""
+    if action == "install":
+        result = _apply_install(conn, body)
+    elif action == "disassemble":
+        result = _apply_disassemble(conn, body)
+    elif action == "test_load":
+        result = _apply_test_load(conn, seq, body)
+    else:
+        result = _apply_remove_support(conn, body)
+    # 每步重建连接图做施工中校验：装/拆改变连接图，试载也必须作用于
+    # 当前经在位连接或临时支承可达的构件（卸撑在自身函数内做更严校验）
+    if action in ("install", "disassemble", "test_load"):
+        _check_construction_reachability(conn)
+    return result
+
+
+def _step_payload(body):
+    return {k: v for k, v in body.items() if k not in ("seq", "action")}
+
+
+def _insert_step(conn, seq, action, payload, result, created_at):
+    conn.execute(
+        "INSERT INTO steps(seq, action, payload, result, created_at) VALUES(?,?,?,?,?)",
+        (seq, action,
+         json.dumps(payload, ensure_ascii=False),
+         json.dumps(result, ensure_ascii=False),
+         created_at),
+    )
+
+
 def create_step(body):
     seq, action = body.get("seq"), body.get("action")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
         raise bad_request("seq 须为正整数")
-    if action not in ("install", "disassemble", "test_load", "remove_support"):
-        raise bad_request("action 须为 install/disassemble/test_load/remove_support")
+    _validate_action(action)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        last = conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM steps").fetchone()["s"]
+        last = _last_seq(conn)
         if seq != last + 1:
             raise reject(
                 "sequence_gap",
                 f"工序跳号：期望工序号 {last + 1}，实收 {seq}，整步拒绝",
                 expected=last + 1, got=seq,
             )
-        if action == "install":
-            result = _apply_install(conn, body)
-        elif action == "disassemble":
-            result = _apply_disassemble(conn, body)
-        elif action == "test_load":
-            result = _apply_test_load(conn, seq, body)
-        else:
-            result = _apply_remove_support(conn, body)
-        # 每步重建连接图做施工中校验：装/拆改变连接图，试载也必须作用于
-        # 当前经在位连接或临时支承可达的构件（卸撑在自身函数内做更严校验）
-        if action in ("install", "disassemble", "test_load"):
-            _check_construction_reachability(conn)
-        receipt = {
-            "seq": seq,
-            "action": action,
-            "payload": {k: v for k, v in body.items() if k not in ("seq", "action")},
-            "result": result,
-            "created_at": now(),
-        }
-        conn.execute(
-            "INSERT INTO steps(seq, action, payload, result, created_at) VALUES(?,?,?,?,?)",
-            (seq, action,
-             json.dumps(receipt["payload"], ensure_ascii=False),
-             json.dumps(result, ensure_ascii=False),
-             receipt["created_at"]),
-        )
+        result = _apply_step(conn, seq, action, body)
+        payload = _step_payload(body)
+        created = now()
+        _insert_step(conn, seq, action, payload, result, created)
         conn.commit()
-        return 201, receipt
+        return 201, {"seq": seq, "action": action, "payload": payload,
+                     "result": result, "created_at": created}
     except Exception:
         conn.rollback()   # 整步拒绝：已有回执与状态不变
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 施工预案（预演 + 一次确认）
+
+def _canonical(obj):
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _registry_hash(conn):
+    """当前登记指纹：支承点、构件、连接、临时支撑登记簿的全量内容。"""
+    tables = {}
+    for t in ("supports", "components", "connections", "temp_supports"):
+        tables[t] = [dict(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid")]
+    return hashlib.sha256(_canonical(tables).encode("utf-8")).hexdigest()
+
+
+def _plan_secret(conn):
+    row = conn.execute("SELECT v FROM meta WHERE k='plan_secret'").fetchone()
+    if row is None:  # init_db 已保证存在；兜底现场生成
+        secret = secrets.token_hex(32)
+        conn.execute("INSERT INTO meta(k, v) VALUES('plan_secret', ?)", (secret,))
+        return secret
+    return row["v"]
+
+
+def _make_credential(conn, items):
+    """确认凭据：HMAC 绑定工序清单、当前登记与工序状态（末条回执号、连接版本）。"""
+    payload = {
+        "plan": hashlib.sha256(_canonical(items).encode("utf-8")).hexdigest(),
+        "registry": _registry_hash(conn),
+        "last_seq": _last_seq(conn),
+        "version": _version(conn),
+    }
+    sig = hmac.new(_plan_secret(conn).encode("utf-8"),
+                   _canonical(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(_canonical(payload).encode("utf-8")).decode("ascii")
+    return f"v1.{token}.{sig}"
+
+
+def _parse_credential(conn, cred):
+    try:
+        kind, token, sig = cred.split(".")
+        if kind != "v1":
+            raise ValueError("unknown kind")
+        payload = json.loads(
+            base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("bad payload")
+    except Exception:
+        raise ApiError(400, "invalid_credential", "确认凭据无法解析，请重新预演获取")
+    expect = hmac.new(_plan_secret(conn).encode("utf-8"),
+                      _canonical(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expect, sig):
+        raise ApiError(400, "invalid_credential", "确认凭据签名无效，请重新预演获取")
+    return payload
+
+
+def _plan_items(body):
+    items = body.get("steps")
+    if not isinstance(items, list) or not items:
+        raise bad_request("steps 须为非空工序数组（按现有单步字段，从末条回执后连续编号）")
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise bad_request(f"清单第 {i + 1} 项须为 JSON 对象")
+        _validate_action(item.get("action"))
+    return items
+
+
+def _check_item_seq(item, seq, index):
+    """清单项可省略 seq（自动从末条回执后连续编号）；若携带必须一致。"""
+    if "seq" not in item:
+        return
+    s = item["seq"]
+    if isinstance(s, bool) or not isinstance(s, int) or s != seq:
+        raise bad_request(f"清单第 {index + 1} 项 seq 须为 {seq}（末条回执后连续编号）或省略")
+
+
+def _plan_failure(err, index, seq, item):
+    """预案某步失败：指出出错工序，保留原有错误码、信息与附加字段。"""
+    return ApiError(
+        err.status, err.code, err.message,
+        failed_step={"index": index + 1, "seq": seq, "action": item.get("action")},
+        **err.extra,
+    )
+
+
+def _run_plan(conn, items, base):
+    """在同一事务内逐步套用工序规则；后步可见前步的支撑、连接版本与试载变化。"""
+    out = []
+    for i, item in enumerate(items):
+        seq = base + i + 1
+        _check_item_seq(item, seq, i)
+        try:
+            result = _apply_step(conn, seq, item["action"], item)
+        except ApiError as e:
+            raise _plan_failure(e, i, seq, item)
+        out.append({
+            "seq": seq, "action": item["action"],
+            "payload": _step_payload(item), "result": result,
+        })
+    return out
+
+
+def preview_plan(body):
+    items = _plan_items(body)
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        base = _last_seq(conn)
+        version = _version(conn)
+        credential = _make_credential(conn, items)  # 绑定预演时的登记与工序状态
+        planned = _run_plan(conn, items, base)
+        return 200, {
+            "ok": True,
+            "base_seq": base,
+            "base_version": version,
+            "steps": planned,
+            "credential": credential,
+        }
+    finally:
+        conn.rollback()   # 预演不留下改动：工序、连接版本、临时支撑、试载全部还原
+        conn.close()
+
+
+def confirm_plan(body):
+    items = _plan_items(body)
+    cred = body.get("credential")
+    if not isinstance(cred, str) or not cred:
+        raise bad_request("缺少合法字段 credential（预演返回的确认凭据）")
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        bound = _parse_credential(conn, cred)
+        plan_hash = hashlib.sha256(_canonical(items).encode("utf-8")).hexdigest()
+        if bound.get("plan") != plan_hash:
+            raise ApiError(409, "plan_mismatch",
+                           "确认清单与预演清单不一致，请携带原清单或重新预演")
+        changed = []
+        if bound.get("registry") != _registry_hash(conn):
+            changed.append("registry")
+        if bound.get("last_seq") != _last_seq(conn) or bound.get("version") != _version(conn):
+            changed.append("steps")
+        if changed:
+            raise ApiError(409, "plan_stale",
+                           "预演后登记或工序状态已变化，凭据过期，请重新预演",
+                           changed=changed)
+        # 一次写事务中复核整单：全部成功才保存；任一步失败由 except 回滚整单
+        receipts = []
+        for planned in _run_plan(conn, items, _last_seq(conn)):
+            created = now()
+            _insert_step(conn, planned["seq"], planned["action"],
+                         planned["payload"], planned["result"], created)
+            receipts.append({**planned, "created_at": created})
+        conn.commit()
+        return 201, {"ok": True, "receipts": receipts}
+    except Exception:
+        conn.rollback()   # 回滚整单新增的工序、连接版本、临时支撑状态及试载
         raise
     finally:
         conn.close()
@@ -578,7 +778,7 @@ def create_snapshot(_body):
                 f"构件 {bad} 缺少在当前连接状态(v{v})下通过的试载，不能固化快照",
                 component=bad,
             )
-        last = conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM steps").fetchone()["s"]
+        last = _last_seq(conn)
         comp_list = []
         for c in comps:
             if not c["in_place"]:
@@ -696,7 +896,7 @@ def get_state():
             "SELECT id, a, b, in_place FROM connections ORDER BY rowid")]
         shores = [dict(r, in_place=bool(r["in_place"])) for r in conn.execute(
             "SELECT id, a, b, in_place FROM temp_supports ORDER BY rowid")]
-        last = conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM steps").fetchone()["s"]
+        last = _last_seq(conn)
         return 200, {
             "version": v,
             "last_seq": last,
@@ -747,6 +947,8 @@ def route(method, path, body):
                 "POST /temp-supports       登记临时支撑",
                 "POST /replacements        登记替换件",
                 "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑回执",
+                "POST /plan/preview        施工预案预演：整单模拟，返回每步预计结果与确认凭据（不留改动）",
+                "POST /plan/confirm        施工预案确认：凭据有效且状态未变时一次写事务执行整单",
                 "GET  /steps | /steps/{n}  查询各工序回执与结果",
                 "GET  /state               当前连接图与各构件状态",
                 "POST /snapshots           卸撑完成后固化验收快照（只增不改）",
@@ -765,6 +967,10 @@ def route(method, path, body):
         return create_replacement(body)
     if method == "POST" and path == "/steps":
         return create_step(body)
+    if method == "POST" and path == "/plan/preview":
+        return preview_plan(body)
+    if method == "POST" and path == "/plan/confirm":
+        return confirm_plan(body)
     if method == "POST" and path == "/snapshots":
         return create_snapshot(body)
     if method == "GET" and path in ("/supports", "/components", "/connections",
