@@ -28,8 +28,22 @@
   试载记录当时版本，版本过期即失效。临时支撑的装/卸不改变版本。
 - 卸撑全部完成后可 POST /snapshots 固化验收快照；快照只增不改，
   后续修复工序不会改写旧快照。
+
+施工预案
+--------
+- POST /plan/preview：按现有单步字段提交从末条回执后连续编号的工序清单
+  （install / disassemble / test_load / remove_support），在同一事务内逐步
+  套用现有传力路径与试载规则——后一步能看到前一步带来的支撑、连接版本与
+  试载变化。成功返回每步预计结果及绑定清单、当前登记和工序状态的确认凭据；
+  失败指出出错工序及原有错误。无论成败，预演不留下任何改动。
+- POST /plan/confirm：携带原清单与凭据。预演后有登记或工序变化（或清单被
+  改动）即拒绝；确认在一次写事务中复核整单，全部成功才保存并返回按序回执；
+  任一步失败指出该步并回滚整单新增的工序、连接版本、临时支撑状态及试载，
+  旧回执与验收快照不变。
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -496,6 +510,44 @@ def _apply_remove_support(conn, body):
     }
 
 
+def _apply_action(conn, seq, action, body):
+    """按动作套用单步工序并返回执行结果。
+
+    装/拆改变连接图，试载也必须作用于当前经在位连接或临时支承可达的构件，
+    因此这三类工序套用后重建连接图做施工中校验（卸撑在自身函数内做更严校验）。
+    """
+    if action == "install":
+        result = _apply_install(conn, body)
+    elif action == "disassemble":
+        result = _apply_disassemble(conn, body)
+    elif action == "test_load":
+        result = _apply_test_load(conn, seq, body)
+    else:
+        result = _apply_remove_support(conn, body)
+    if action in ("install", "disassemble", "test_load"):
+        _check_construction_reachability(conn)
+    return result
+
+
+def _record_receipt(conn, seq, action, body, result):
+    """写入工序回执并返回回执对象。"""
+    receipt = {
+        "seq": seq,
+        "action": action,
+        "payload": {k: v for k, v in body.items() if k not in ("seq", "action")},
+        "result": result,
+        "created_at": now(),
+    }
+    conn.execute(
+        "INSERT INTO steps(seq, action, payload, result, created_at) VALUES(?,?,?,?,?)",
+        (seq, action,
+         json.dumps(receipt["payload"], ensure_ascii=False),
+         json.dumps(result, ensure_ascii=False),
+         receipt["created_at"]),
+    )
+    return receipt
+
+
 def create_step(body):
     seq, action = body.get("seq"), body.get("action")
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
@@ -512,36 +564,142 @@ def create_step(body):
                 f"工序跳号：期望工序号 {last + 1}，实收 {seq}，整步拒绝",
                 expected=last + 1, got=seq,
             )
-        if action == "install":
-            result = _apply_install(conn, body)
-        elif action == "disassemble":
-            result = _apply_disassemble(conn, body)
-        elif action == "test_load":
-            result = _apply_test_load(conn, seq, body)
-        else:
-            result = _apply_remove_support(conn, body)
-        # 每步重建连接图做施工中校验：装/拆改变连接图，试载也必须作用于
-        # 当前经在位连接或临时支承可达的构件（卸撑在自身函数内做更严校验）
-        if action in ("install", "disassemble", "test_load"):
-            _check_construction_reachability(conn)
-        receipt = {
-            "seq": seq,
-            "action": action,
-            "payload": {k: v for k, v in body.items() if k not in ("seq", "action")},
-            "result": result,
-            "created_at": now(),
-        }
-        conn.execute(
-            "INSERT INTO steps(seq, action, payload, result, created_at) VALUES(?,?,?,?,?)",
-            (seq, action,
-             json.dumps(receipt["payload"], ensure_ascii=False),
-             json.dumps(result, ensure_ascii=False),
-             receipt["created_at"]),
-        )
+        result = _apply_action(conn, seq, action, body)
+        receipt = _record_receipt(conn, seq, action, body, result)
         conn.commit()
         return 201, receipt
     except Exception:
         conn.rollback()   # 整步拒绝：已有回执与状态不变
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 施工预案（预演 / 确认）
+
+def _normalize_plan_items(conn, body, enforce_continuity):
+    """校验清单形状并补齐工序号：清单从末条回执后连续编号。
+
+    各项字段与 POST /steps 单步相同；seq 可省略（由服务端连续补齐），显式给出时
+    预演阶段必须吻合编号，否则整单拒绝。确认阶段编号一致性由凭据保证（凭据绑定
+    了补齐后的清单与当前状态），不再重复校验。
+    """
+    steps = body.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise bad_request("steps 须为非空工序数组")
+    last = conn.execute("SELECT COALESCE(MAX(seq),0) AS s FROM steps").fetchone()["s"]
+    items = []
+    for i, raw in enumerate(steps):
+        if not isinstance(raw, dict):
+            raise bad_request(f"清单第 {i + 1} 项须为 JSON 对象")
+        item = dict(raw)
+        action = item.get("action")
+        if action not in ("install", "disassemble", "test_load", "remove_support"):
+            raise bad_request(
+                f"清单第 {i + 1} 项 action 须为 install/disassemble/test_load/remove_support")
+        seq = item.get("seq")
+        expected = last + 1 + i
+        if seq is None:
+            item["seq"] = expected
+        else:
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+                raise bad_request(f"清单第 {i + 1} 项 seq 须为正整数")
+            if enforce_continuity and seq != expected:
+                raise reject(
+                    "sequence_gap",
+                    f"清单第 {i + 1} 项工序跳号：期望工序号 {expected}，实收 {seq}，整单拒绝",
+                    expected=expected, got=seq,
+                    failed_step={"index": i, "seq": seq, "action": action},
+                )
+        items.append(item)
+    return items
+
+
+def _table_fingerprint(conn, sql):
+    h = hashlib.sha256()
+    for r in conn.execute(sql):
+        h.update(json.dumps(dict(r), ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _plan_token(conn, items):
+    """确认凭据：绑定清单、当前登记（支承点/构件/连接/临时支撑）与工序状态
+    （连接状态版本、工序回执、试载记录）。任一变化都会使凭据失效。"""
+    list_fp = hashlib.sha256(json.dumps(
+        items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    state_fp = hashlib.sha256("|".join([
+        _table_fingerprint(conn, "SELECT * FROM supports ORDER BY rowid"),
+        _table_fingerprint(conn, "SELECT * FROM components ORDER BY rowid"),
+        _table_fingerprint(conn, "SELECT * FROM connections ORDER BY rowid"),
+        _table_fingerprint(conn, "SELECT * FROM temp_supports ORDER BY rowid"),
+        _table_fingerprint(conn, "SELECT * FROM steps ORDER BY seq"),
+        _table_fingerprint(conn, "SELECT * FROM test_loads ORDER BY id"),
+        str(_version(conn)),
+    ]).encode("utf-8")).hexdigest()
+    return "plan-" + hashlib.sha256(
+        f"{list_fp}:{state_fp}".encode("utf-8")).hexdigest()
+
+
+def _execute_plan(conn, items):
+    """在当前事务内依次套用整单工序并写入回执：后一步可见前一步带来的支撑、
+    连接版本与试载变化。任一步失败抛出原错误并附 failed_step，由调用方回滚整单
+    （工序、连接版本、临时支撑状态及试载）。"""
+    receipts = []
+    for i, item in enumerate(items):
+        seq, action = item["seq"], item["action"]
+        try:
+            result = _apply_action(conn, seq, action, item)
+        except ApiError as e:
+            e.extra.setdefault(
+                "failed_step", {"index": i, "seq": seq, "action": action})
+            raise
+        receipts.append(_record_receipt(conn, seq, action, item, result))
+    return receipts
+
+
+def preview_plan(body):
+    """预演：在同一事务内逐步套用清单，成功返回每步预计结果与确认凭据；
+    无论成败都回滚，预演不留下任何改动。"""
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        items = _normalize_plan_items(conn, body, enforce_continuity=True)
+        token = _plan_token(conn, items)  # 凭据绑定清单与当前登记、工序状态
+        receipts = _execute_plan(conn, items)
+        return 200, {
+            "ok": True,
+            "token": token,
+            "base_seq": items[0]["seq"] - 1,
+            "steps": [{k: r[k] for k in ("seq", "action", "payload", "result")}
+                      for r in receipts],
+            "resulting": {"last_seq": receipts[-1]["seq"], "version": _version(conn)},
+        }
+    finally:
+        conn.rollback()   # 预演不留下改动
+        conn.close()
+
+
+def confirm_plan(body):
+    """确认：凭据须匹配清单与当前登记、工序状态（预演后有变化即拒绝）；
+    在一次写事务中复核整单，全部成功才保存并返回按序回执。"""
+    token = body.get("token")
+    if not isinstance(token, str) or not token:
+        raise bad_request("缺少合法字段 token（预演返回的确认凭据）")
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        items = _normalize_plan_items(conn, body, enforce_continuity=False)
+        if not hmac.compare_digest(_plan_token(conn, items), token):
+            raise ApiError(
+                409, "plan_stale",
+                "凭据与清单或当前登记、工序状态不符：预演后已有登记或工序变化，"
+                "或清单被改动，请重新预演")
+        receipts = _execute_plan(conn, items)
+        conn.commit()
+        return 201, {"ok": True, "token": token, "receipts": receipts}
+    except Exception:
+        conn.rollback()   # 任一步失败：整单新增的工序、连接版本、临时支撑状态及试载全部回滚
         raise
     finally:
         conn.close()
@@ -747,6 +905,8 @@ def route(method, path, body):
                 "POST /temp-supports       登记临时支撑",
                 "POST /replacements        登记替换件",
                 "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑回执",
+                "POST /plan/preview         预演工序清单：逐步套用规则，返回每步预计结果与确认凭据（不留改动）",
+                "POST /plan/confirm         凭据确认：一次写事务复核整单，全部成功才保存按序回执",
                 "GET  /steps | /steps/{n}  查询各工序回执与结果",
                 "GET  /state               当前连接图与各构件状态",
                 "POST /snapshots           卸撑完成后固化验收快照（只增不改）",
@@ -765,6 +925,10 @@ def route(method, path, body):
         return create_replacement(body)
     if method == "POST" and path == "/steps":
         return create_step(body)
+    if method == "POST" and path == "/plan/preview":
+        return preview_plan(body)
+    if method == "POST" and path == "/plan/confirm":
+        return confirm_plan(body)
     if method == "POST" and path == "/snapshots":
         return create_snapshot(body)
     if method == "GET" and path in ("/supports", "/components", "/connections",

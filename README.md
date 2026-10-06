@@ -3,6 +3,7 @@
 仅用 **Python 标准库**（`http.server` + `sqlite3`）实现的木构件修复验收服务。
 登记固定支承点、承重构件（含最低试载值）、榫卯连接、临时支撑与替换件；
 按递增工序号提交拆卸 / 安装 / 试载 / 卸撑回执；每个工序重建当前连接图并做结构校验；
+支持整单工序的施工预案（预演 + 凭据确认，一次写事务复核）；
 卸撑完成后可固化不可改写的验收快照。
 
 ## 启动
@@ -32,6 +33,16 @@ docker compose up --build
 - **改接限制**：安装连接只允许使用事先登记的端点组合（`POST /connections` 登记的 id）。
 - **整步拒绝**：跳号、端点不在位、可达性或卸撑条件不满足时返回 409，
   响应含 `first_affected_component`（首个受影响构件），已有回执与状态不变。
+- **施工预案（预演 / 确认）**：`POST /plan/preview` 按现有单步字段提交从末条回执后
+  连续编号的工序清单（`steps` 数组，各项字段与 `POST /steps` 相同；`seq` 可省略，
+  由服务端从末条回执后连续补齐，显式给出则必须吻合，跳号整单拒绝）。预演在同一
+  事务内逐步套用现有传力路径与试载规则——后一步能看到前一步带来的支撑、连接版本
+  与试载变化；成功返回每步预计结果及绑定清单、当前登记和工序状态的确认凭据
+  `token`，失败返回原有错误并附 `failed_step` 指出出错工序；无论成败预演都不留下
+  改动。`POST /plan/confirm` 携带原清单与 `token`：预演后登记或工序状态有任何变化
+  （或清单被改动）即 409 `plan_stale` 拒绝，需重新预演；确认在一次写事务中复核整单，
+  全部成功才保存并返回按序回执，任一步失败指出该步并回滚整单新增的工序、连接版本、
+  临时支撑状态及试载，旧回执与验收快照不变。
 - **快照**：所有临时支撑卸除且校验通过后可 `POST /snapshots` 固化；快照只增不改，
   后续修复工序不会改写旧快照。
 
@@ -45,6 +56,8 @@ docker compose up --build
 | POST | `/connections` | 登记榫卯连接 `{id, a, b, in_place?}`（默认 true；改接预留组合传 false） |
 | POST | `/temp-supports` | 登记临时支撑 `{id, a, b, in_place?}`（默认 false） |
 | POST | `/steps` | 提交工序回执（见下） |
+| POST | `/plan/preview` | 预演工序清单：逐步套用规则，返回每步预计结果与确认凭据（不留改动） |
+| POST | `/plan/confirm` | 凭据确认：一次写事务复核整单，全部成功才保存按序回执 |
 | GET | `/steps`、`/steps/{seq}` | 查询各工序回执与结果 |
 | GET | `/state` | 当前连接图、各构件可达性与最近试载 |
 | POST | `/snapshots` | 卸撑完成后固化验收快照 |
@@ -126,6 +139,83 @@ curl $B/state        # 当前连接图与各构件状态
 curl $B/snapshots/1  # 验收快照
 ```
 
+## 施工预案：预演、过期拒绝与确认
+
+整单工序先预演、后确认：预演逐步套用现有传力路径与试载规则（后一步能看到
+前一步带来的支撑、连接版本与试载变化），成功返回每步预计结果与确认凭据，
+自身不留下改动；凭据绑定清单、当前登记与工序状态，预演后有任何变化即过期；
+确认在一次写事务中复核整单，全部成功才保存按序回执，任一步失败整单回滚。
+
+一键执行（含断言，请在空库上跑，例如 `docker compose up --build` 后的全新卷）：
+
+```bash
+./demo_plan.sh
+```
+
+或逐条手动执行（空库；清单存入 `STEPS` 变量以便预演、确认复用同一份）：
+
+```bash
+B=http://localhost:8080
+
+# 0) 登记
+curl -X POST $B/supports      -d '{"id":"PS1","name":"西柱础"}'
+curl -X POST $B/supports      -d '{"id":"PS2","name":"东台基"}'
+curl -X POST $B/components    -d '{"id":"PC1","name":"西金柱","min_load":10}'
+curl -X POST $B/components    -d '{"id":"PC2","name":"东金柱","min_load":8}'
+curl -X POST $B/replacements  -d '{"id":"PR2","name":"替换东金柱","min_load":8}'
+curl -X POST $B/connections   -d '{"id":"PJ1","a":"PS1","b":"PC1"}'
+curl -X POST $B/connections   -d '{"id":"PJ2","a":"PC1","b":"PC2"}'
+curl -X POST $B/connections   -d '{"id":"PJ3","a":"PC1","b":"PR2","in_place":false}'
+curl -X POST $B/connections   -d '{"id":"PJ4","a":"PS2","b":"PR2","in_place":false}'
+curl -X POST $B/temp-supports -d '{"id":"PT1","a":"PS2","b":"PC1"}'
+
+# 1) 失败预演：卸撑前未试载 → 409 指出出错工序，预演不留下改动
+curl -X POST $B/plan/preview -d '{"steps":[
+  {"action":"install","target":"temp_support","id":"PT1"},
+  {"action":"remove_support","id":"PT1"}
+]}'
+#   → 409 test_load_missing，first_affected_component=PC1，
+#     failed_step={"index":1,"seq":2,"action":"remove_support"}
+curl $B/steps    # 仍为 []：预演不留下任何回执与状态变化
+
+# 2) 成功预演：清单按现有单步字段提交，从末条回执后连续编号
+#    （seq 可省略由服务端补齐；显式给出须吻合，跳号 409 sequence_gap）
+STEPS='[
+  {"seq":1,"action":"install","target":"temp_support","id":"PT1"},
+  {"seq":2,"action":"disassemble","target":"component","id":"PC2"},
+  {"seq":3,"action":"install","target":"replacement","id":"PR2","connections":["PJ3","PJ4"]},
+  {"seq":4,"action":"test_load","component":"PC1","load":12},
+  {"seq":5,"action":"test_load","component":"PR2","load":9.5},
+  {"seq":6,"action":"remove_support","id":"PT1"}
+]'
+curl -X POST $B/plan/preview -d "{\"steps\":$STEPS}"
+#   → 200 {"ok":true,"token":"plan-…","base_seq":0,
+#          "steps":[每步 seq/action/payload/预计 result],
+#          "resulting":{"last_seq":6,"version":2}}
+#    试载预计落在 v2：前两步装/拆已把连接状态版本从 v0 递进
+#    保存凭据（需 python3；也可手工复制响应中的 token）：
+TOKEN=$(curl -s -X POST $B/plan/preview -d "{\"steps\":$STEPS}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+# 3) 过期拒绝：预演后登记（或工序）发生变化，原凭据失效
+curl -X POST $B/temp-supports -d '{"id":"PT2","a":"PS1","b":"PC2"}'
+curl -X POST $B/plan/confirm -d "{\"steps\":$STEPS,\"token\":\"$TOKEN\"}"
+#   → 409 plan_stale：预演后已有登记或工序变化，或清单被改动，请重新预演
+#   不写入任何工序；改动清单内容而沿用旧凭据同样 409
+
+# 4) 重新预演取得新凭据后确认：一次写事务复核整单
+TOKEN=$(curl -s -X POST $B/plan/preview -d "{\"steps\":$STEPS}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+curl -X POST $B/plan/confirm -d "{\"steps\":$STEPS,\"token\":\"$TOKEN\"}"
+#   → 201 {"ok":true,"receipts":[seq 1..6 按序回执，含 created_at]}
+#   任一步失败则指出 failed_step 并回滚整单新增的工序、连接版本、
+#   临时支撑状态及试载，旧回执与验收快照不变
+
+# 5) 确认后流程如常：卸撑完成可固化快照，/steps 单步从 seq 7 继续
+curl -X POST $B/snapshots -d '{}'
+curl -X POST $B/steps -d '{"seq":7,"action":"test_load","component":"PC1","load":11}'
+```
+
 ## 故障与修复示例：未安装替换件不得充当传力路径
 
 登记固定支承点 `S`、在位承重梁 `C`、**未安装**替换件 `R`，以及 `S—R`、`R—C`
@@ -204,6 +294,10 @@ curl $B/snapshots/1
 | `support_unreachable` | 卸撑后构件无法仅凭永久连接抵达支承点 |
 | `test_load_missing` | 构件缺少当前连接状态下通过的合格试载 |
 | `shoring_incomplete` | 临时支撑未卸完，不能固化快照 |
+| `plan_stale` | 预演后登记或工序状态已变化，或清单与凭据不符，需重新预演 |
+
+预案相关响应补充：预演/确认中某步失败时，响应沿用该步原有错误码与状态码，
+并附 `failed_step`（`index` 为清单内 0 基序号，`seq` 为工序号，`action` 为动作）。
 
 ## 项目结构
 
@@ -213,5 +307,6 @@ Dockerfile          # python:3.12-slim 单容器镜像
 docker-compose.yml  # 单条命令启动，卷持久化
 demo.sh             # 端到端演示脚本
 demo_uninstalled_replacement.sh  # 未安装替换件虚假路径：故障复现与修复演示
+demo_plan.sh        # 施工预案演示：预演 → 过期拒绝 → 一次写事务确认
 README.md
 ```
